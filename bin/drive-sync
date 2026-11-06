@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# drive-sync — two-way Google Drive sync for Linux, built on `rclone bisync`.
+#
+# Each "pair" maps a local directory to a Drive path. On every run, changes on
+# either side are propagated to the other. When the same file changed on both
+# sides, the newer modification time wins; the older copy is kept with a
+# ".conflictN" suffix so nothing is silently lost.
+#
+# Config:  ${XDG_CONFIG_HOME:-~/.config}/drive-sync/pairs.conf
+#          one pair per line:  name|/local/path|remote:path[|/path/to/filters]
+# State:   ${XDG_STATE_HOME:-~/.local/state}/drive-sync/  (logs, locks)
+
+set -euo pipefail
+
+VERSION="0.1.0"
+MIN_RCLONE="1.66.0"   # first release with --conflict-resolve / --resync-mode
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drive-sync"
+PAIRS="$CONF_DIR/pairs.conf"
+DEFAULT_FILTERS="$CONF_DIR/default.filters"
+RCLONE="${RCLONE:-rclone}"
+
+# Flags used for every bisync run.
+BISYNC_FLAGS=(
+  --conflict-resolve newer      # newest modtime wins on a both-sides change
+  --conflict-loser num          # keep the loser as file.conflict1, .conflict2 ...
+  --resilient                   # retry after non-critical errors instead of locking out
+  --recover                     # recover from an interrupted run without --resync
+  --max-lock 2m                 # treat lock files older than this as stale
+  --create-empty-src-dirs
+  --drive-skip-gdocs            # native Docs/Sheets have no size; skip them
+  --compare size,modtime
+  --track-renames
+)
+
+die()  { printf 'drive-sync: %s\n' "$*" >&2; exit 1; }
+info() { printf 'drive-sync: %s\n' "$*"; }
+
+usage() {
+  cat <<EOF
+drive-sync $VERSION — two-way Google Drive sync (rclone bisync, newest wins)
+
+Usage:
+  drive-sync add NAME LOCAL_DIR REMOTE:PATH [FILTERS_FILE]
+                               register a pair and run the first merge
+  drive-sync sync [NAME [RCLONE_FLAGS...]]
+                               sync one pair, or all pairs if NAME omitted;
+                               e.g. 'drive-sync sync docs --force' after a safety abort
+  drive-sync dry-run NAME      show what a sync would do, change nothing
+  drive-sync resync NAME       rebuild sync state (needed after editing filters
+                               or after a critical error); merges, never deletes
+  drive-sync list              list configured pairs
+  drive-sync status            last result per pair
+  drive-sync log NAME [N]      show the last N log lines (default 50)
+  drive-sync remove NAME       unregister a pair (files are not touched)
+  drive-sync install-timer [INTERVAL]
+                               run 'sync' via a systemd user timer (default 5min)
+  drive-sync uninstall-timer
+  drive-sync version
+EOF
+}
+
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+check_rclone() {
+  command -v "$RCLONE" >/dev/null 2>&1 || die "rclone not found. Run install.sh first."
+  local v
+  v="$("$RCLONE" version 2>/dev/null | awk 'NR==1{sub(/^v/,"",$2); print $2}')"
+  version_ge "${v%%-*}" "$MIN_RCLONE" || die "rclone $v is too old; need >= $MIN_RCLONE (run install.sh)."
+}
+
+ensure_dirs() {
+  mkdir -p "$CONF_DIR" "$STATE_DIR"
+  touch "$PAIRS"
+}
+
+# Print the pairs.conf line for NAME, or nothing.
+pair_line() { awk -F'|' -v n="$1" '$1==n {print; exit}' "$PAIRS"; }
+
+# Load NAME into globals P_NAME P_LOCAL P_REMOTE P_FILTERS.
+load_pair() {
+  local line
+  line="$(pair_line "$1")"
+  [ -n "$line" ] || die "no pair named '$1' (see: drive-sync list)"
+  IFS='|' read -r P_NAME P_LOCAL P_REMOTE P_FILTERS <<<"$line"
+  P_FILTERS="${P_FILTERS:-$DEFAULT_FILTERS}"
+  [ -d "$P_LOCAL" ] || die "local dir missing for '$P_NAME': $P_LOCAL"
+  [ -f "$P_FILTERS" ] || die "filters file missing for '$P_NAME': $P_FILTERS"
+}
+
+# Run bisync for the loaded pair. Extra args are passed through.
+run_bisync() {
+  local log="$STATE_DIR/$P_NAME.log" lock="$STATE_DIR/$P_NAME.lock" rc=0
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    info "$P_NAME: another sync is running, skipping"
+    return 0
+  fi
+  {
+    printf '\n===== %s  %s %s\n' "$(date -Is)" "$P_NAME" "$*"
+  } >>"$log"
+  "$RCLONE" bisync "$P_LOCAL" "$P_REMOTE" \
+    "${BISYNC_FLAGS[@]}" \
+    --filters-file "$P_FILTERS" \
+    --log-file "$log" -v "$@" </dev/null || rc=$?
+  flock -u 9
+  if [ "$rc" -eq 0 ]; then
+    printf '%s ok\n' "$(date -Is)" >"$STATE_DIR/$P_NAME.status"
+  else
+    printf '%s FAILED rc=%s (see: drive-sync log %s)\n' "$(date -Is)" "$rc" "$P_NAME" \
+      >"$STATE_DIR/$P_NAME.status"
+    local hint="see 'drive-sync log $P_NAME'"
+    if grep -q 'Safety abort' <(tail -n 30 "$log"); then
+      hint="safety abort (too many changes/deletes). Review 'drive-sync log $P_NAME', then: drive-sync sync $P_NAME --force"
+    elif grep -q -- '--resync' <(tail -n 30 "$log"); then
+      hint="rclone asks for a resync. Review 'drive-sync log $P_NAME', then: drive-sync resync $P_NAME"
+    fi
+    info "$P_NAME: FAILED — $hint"
+    command -v notify-send >/dev/null 2>&1 && notify-send -u critical "drive-sync: $P_NAME failed" "$hint" 2>/dev/null || true
+  fi
+  return "$rc"
+}
+
+cmd_add() {
+  [ $# -ge 3 ] || die "usage: drive-sync add NAME LOCAL_DIR REMOTE:PATH [FILTERS_FILE]"
+  local name="$1" local_dir remote="$3" filters="${4:-}"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "NAME may only contain letters, digits, . _ -"
+  [ -z "$(pair_line "$name")" ] || die "pair '$name' already exists"
+  local_dir="$(realpath -e "$2")" || die "local dir not found: $2"
+  [[ "$remote" == *:* ]] || die "REMOTE must look like 'gdrive:folder'"
+  [[ "$local_dir$remote$filters" != *'|'* ]] || die "paths may not contain '|'"
+  [ -z "$filters" ] || filters="$(realpath -e "$filters")"
+  "$RCLONE" listremotes | grep -qx "${remote%%:*}:" \
+    || die "rclone remote '${remote%%:*}:' not configured (run: rclone config)"
+  "$RCLONE" mkdir "$remote"
+  printf '%s|%s|%s|%s\n' "$name" "$local_dir" "$remote" "$filters" >>"$PAIRS"
+  info "added $name: $local_dir <-> $remote"
+  info "running first merge (newer side wins, nothing deleted)..."
+  load_pair "$name"
+  run_bisync --resync --resync-mode newer
+  info "done. Enable automatic sync with: drive-sync install-timer"
+}
+
+cmd_sync() {
+  if [ $# -ge 1 ]; then
+    local name="$1"; shift
+    load_pair "$name"; run_bisync "$@"   # extra args go to rclone, e.g. --force
+    return
+  fi
+  local rc=0 name
+  while IFS='|' read -r name _; do
+    [ -n "$name" ] && [[ "$name" != \#* ]] || continue
+    ( load_pair "$name"; run_bisync ) || rc=1
+  done <"$PAIRS"
+  return "$rc"
+}
+
+cmd_dry_run() { [ $# -eq 1 ] || die "usage: drive-sync dry-run NAME"; load_pair "$1"; run_bisync --dry-run; tail -n 40 "$STATE_DIR/$1.log"; }
+cmd_resync()  { [ $# -eq 1 ] || die "usage: drive-sync resync NAME";  load_pair "$1"; run_bisync --resync --resync-mode newer; }
+
+cmd_list() {
+  printf '%-20s %-45s %s\n' NAME LOCAL REMOTE
+  awk -F'|' 'NF>=3 && $1 !~ /^#/ {printf "%-20s %-45s %s\n", $1, $2, $3}' "$PAIRS"
+}
+
+cmd_status() {
+  local name
+  while IFS='|' read -r name _; do
+    [ -n "$name" ] && [[ "$name" != \#* ]] || continue
+    printf '%-20s %s\n' "$name" "$(cat "$STATE_DIR/$name.status" 2>/dev/null || echo 'never run')"
+  done <"$PAIRS"
+  if systemctl --user is-active --quiet drive-sync.timer 2>/dev/null; then
+    systemctl --user list-timers drive-sync.timer --no-pager | sed -n '1,2p'
+  else
+    echo "timer: not active (drive-sync install-timer)"
+  fi
+}
+
+cmd_log() { [ $# -ge 1 ] || die "usage: drive-sync log NAME [N]"; tail -n "${2:-50}" "$STATE_DIR/$1.log"; }
+
+cmd_remove() {
+  [ $# -eq 1 ] || die "usage: drive-sync remove NAME"
+  [ -n "$(pair_line "$1")" ] || die "no pair named '$1'"
+  local tmp; tmp="$(mktemp)"
+  awk -F'|' -v n="$1" '$1!=n' "$PAIRS" >"$tmp" && mv "$tmp" "$PAIRS"
+  info "removed $1 (local and Drive files untouched)"
+}
+
+cmd_install_timer() {
+  local interval="${1:-5min}" unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" self
+  self="$(realpath "$0")"
+  mkdir -p "$unit_dir"
+  cat >"$unit_dir/drive-sync.service" <<EOF
+[Unit]
+Description=drive-sync: two-way Google Drive sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$self sync
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+IOSchedulingClass=idle
+EOF
+  cat >"$unit_dir/drive-sync.timer" <<EOF
+[Unit]
+Description=Run drive-sync every $interval
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=$interval
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now drive-sync.timer
+  info "timer enabled (every $interval). Check with: drive-sync status"
+}
+
+cmd_uninstall_timer() {
+  systemctl --user disable --now drive-sync.timer 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/drive-sync."{service,timer}
+  systemctl --user daemon-reload
+  info "timer removed"
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    help|-h|--help) usage; return ;;
+    version|--version) echo "drive-sync $VERSION"; return ;;
+  esac
+  ensure_dirs
+  case "$cmd" in
+    install-timer)   cmd_install_timer "$@"; return ;;
+    uninstall-timer) cmd_uninstall_timer; return ;;
+    list)            cmd_list; return ;;
+    status)          cmd_status; return ;;
+    log)             cmd_log "$@"; return ;;
+    remove)          cmd_remove "$@"; return ;;
+  esac
+  check_rclone
+  [ -f "$DEFAULT_FILTERS" ] || die "default filters missing: $DEFAULT_FILTERS (run install.sh)"
+  case "$cmd" in
+    add)     cmd_add "$@" ;;
+    sync)    cmd_sync "$@" ;;
+    dry-run) cmd_dry_run "$@" ;;
+    resync)  cmd_resync "$@" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,38 @@
+# drive-sync default filters (rclone filter syntax, first match wins).
+# After editing a pair's filters file you must run: drive-sync resync NAME
+
+# Version control and editor state
+- .git/**
+- .svn/**
+- *.swp
+- *~
+- .DS_Store
+
+# Build output, dependencies, caches
+- node_modules/**
+- __pycache__/**
+- *.pyc
+- .venv/**
+- venv/**
+- .pytest_cache/**
+- .mypy_cache/**
+- dist/**
+- build/**
+
+# Terraform: provider binaries are huge; state files can contain secrets
+- .terraform/**
+- *.tfstate
+- *.tfstate.*
+- *.tfplan
+- tfplan
+
+# Secrets and keys (never push to Drive)
+- .env
+- .env.*
+- *.pem
+- *.key
+- id_rsa*
+- id_ed25519*
+
+# Everything else is synced
++ **
