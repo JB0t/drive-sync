@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# drive-sync-zip-dirs: keep a zip snapshot of selected folders inside a pair,
+# so they can be downloaded in one go (the Drive mobile app cannot download
+# folders).
+#
+# Usage (from a pre-sync hook, which drive-sync runs with DRIVE_SYNC_* set):
+#   drive-sync-zip-dirs DIR [DIR...]
+#
+# For each DIR (relative to the pair's local root) this writes
+#   <local root>/_zips/DIR.zip
+# containing DIR's files after the pair's filters are applied, so nothing the
+# filters keep out of Drive ends up inside a zip either. A zip is rebuilt only
+# when DIR's filtered file list (path, size, modtime) has changed, so an
+# unchanged zip is not re-uploaded on every run.
+
+set -euo pipefail
+: "${DRIVE_SYNC_LOCAL:?run me from a drive-sync pre-sync hook}"
+: "${DRIVE_SYNC_FILTERS:?}" "${DRIVE_SYNC_STATE:?}" "${DRIVE_SYNC_NAME:?}"
+[ $# -ge 1 ] || { echo "usage: drive-sync-zip-dirs DIR [DIR...]" >&2; exit 2; }
+command -v zip >/dev/null || { echo "zip-dirs: 'zip' is not installed" >&2; exit 1; }
+
+out="$DRIVE_SYNC_LOCAL/_zips"
+seen="$DRIVE_SYNC_STATE/zips"
+mkdir -p "$out" "$seen"
+cd "$DRIVE_SYNC_LOCAL"
+
+# One filtered listing of the whole pair: path|size|modtime.
+# Listing from the pair root keeps root-anchored filter rules ("/x/**") correct.
+listing="$(rclone lsf -R --files-only --format pst --separator '|' \
+             --filter-from "$DRIVE_SYNC_FILTERS" .)"
+
+rc=0
+for d in "$@"; do
+  d="${d%/}"
+  if [ ! -d "$d" ]; then echo "zip-dirs: skipping missing folder: $d" >&2; rc=1; continue; fi
+  files="$(awk -F'|' -v p="$d/" 'index($1, p) == 1' <<<"$listing" | sort)"
+  [ -n "$files" ] || { echo "zip-dirs: nothing to zip in $d" >&2; continue; }
+  sum="$(sha256sum <<<"$files" | cut -d' ' -f1)"
+  stamp="$seen/$DRIVE_SYNC_NAME--${d//\//_}.sha256"
+  if [ -f "$out/$d.zip" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$sum" ]; then
+    continue
+  fi
+  mkdir -p "$(dirname "$out/$d.zip")"
+  tmp="$seen/build.$$.zip"; rm -f "$tmp"     # build outside the synced tree
+  cut -d'|' -f1 <<<"$files" | zip -q -X -@ "$tmp"
+  mv -f "$tmp" "$out/$d.zip"
+  printf '%s\n' "$sum" >"$stamp"
+  echo "zip-dirs: rebuilt _zips/$d.zip ($(wc -l <<<"$files") files, $(du -h "$out/$d.zip" | cut -f1))"
+done
+exit "$rc"

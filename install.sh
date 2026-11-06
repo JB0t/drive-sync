@@ -48,6 +48,7 @@ fi
 
 mkdir -p "$BIN_DIR" "$CONF_DIR"
 ln -sf "$REPO_DIR/bin/drive-sync" "$BIN_DIR/drive-sync"
+ln -sf "$REPO_DIR/share/hooks/zip-dirs" "$BIN_DIR/drive-sync-zip-dirs"
 [ -f "$CONF_DIR/default.filters" ] || cp "$REPO_DIR/share/default.filters" "$CONF_DIR/default.filters"
 touch "$CONF_DIR/pairs.conf"
 echo "drive-sync linked to $BIN_DIR/drive-sync"

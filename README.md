@@ -70,6 +70,36 @@ A pair can use its own filters file instead of the default:
 drive-sync add notes ~/notes gdrive:notes ~/notes/.drive-sync.filters
 ```
 
+## Zip snapshots for phones (pre-sync hooks)
+
+The Drive mobile app cannot download a whole folder. It can download a single zip file. drive-sync can keep a zip of selected folders up to date inside the pair, and the zips are then uploaded like any other file.
+
+A pair can have a **pre-sync hook**: an executable file at `~/.config/drive-sync/hooks/NAME.pre`. drive-sync runs it before each sync, but not before a dry run. The hook receives these environment variables:
+
+- `DRIVE_SYNC_NAME`
+- `DRIVE_SYNC_LOCAL`
+- `DRIVE_SYNC_REMOTE`
+- `DRIVE_SYNC_FILTERS`
+- `DRIVE_SYNC_STATE`
+
+If the hook fails, the failure is written to the log, and the sync still runs.
+
+`install.sh` installs `drive-sync-zip-dirs`, a ready-made hook helper:
+
+```bash
+mkdir -p ~/.config/drive-sync/hooks
+cat > ~/.config/drive-sync/hooks/role-deep-dives.pre <<'EOF'
+#!/usr/bin/env bash
+exec drive-sync-zip-dirs systematica-platform-engineer-study-guide aquis-exchange-study-guide
+EOF
+chmod +x ~/.config/drive-sync/hooks/role-deep-dives.pre
+```
+
+For each folder you name, the helper writes `_zips/FOLDER.zip` inside the pair:
+
+- The pair's filters apply to the zip as well. Anything kept out of Drive, such as secrets or `.git`, is also kept out of the zip.
+- A zip is rebuilt only when the folder's filtered file list changes, meaning a path, size or modification time. An unchanged zip is not uploaded again on every run.
+
 ## When a sync fails
 
 `drive-sync status` shows `FAILED` for the pair. If `notify-send` is installed, you also get a desktop notification. The failure message tells you what to do next:

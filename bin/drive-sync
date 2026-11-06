@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 MIN_RCLONE="1.66.0"   # first release with --conflict-resolve / --resync-mode
 
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync"
@@ -88,6 +88,20 @@ load_pair() {
   [ -f "$P_FILTERS" ] || die "filters file missing for '$P_NAME': $P_FILTERS"
 }
 
+# Run the pair's optional pre-sync hook: an executable at
+# $CONF_DIR/hooks/NAME.pre (e.g. to refresh zip snapshots before upload).
+# Skipped on --dry-run. A failing hook is logged but does not block the sync.
+run_pre_hook() {
+  local log="$1"; shift
+  local hook="$CONF_DIR/hooks/$P_NAME.pre" a
+  [ -x "$hook" ] || return 0
+  for a in "$@"; do [ "$a" = "--dry-run" ] && return 0; done
+  DRIVE_SYNC_NAME="$P_NAME" DRIVE_SYNC_LOCAL="$P_LOCAL" DRIVE_SYNC_REMOTE="$P_REMOTE" \
+  DRIVE_SYNC_FILTERS="$P_FILTERS" DRIVE_SYNC_STATE="$STATE_DIR" \
+    "$hook" >>"$log" 2>&1 </dev/null \
+    || info "$P_NAME: pre-sync hook failed, syncing anyway (see: drive-sync log $P_NAME)"
+}
+
 # Run bisync for the loaded pair. Extra args are passed through.
 run_bisync() {
   local log="$STATE_DIR/$P_NAME.log" lock="$STATE_DIR/$P_NAME.lock" rc=0
@@ -99,6 +113,7 @@ run_bisync() {
   {
     printf '\n===== %s  %s %s\n' "$(date -Is)" "$P_NAME" "$*"
   } >>"$log"
+  run_pre_hook "$log" "$@"
   "$RCLONE" bisync "$P_LOCAL" "$P_REMOTE" \
     "${BISYNC_FLAGS[@]}" \
     --filters-file "$P_FILTERS" \
