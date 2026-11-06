@@ -33,6 +33,15 @@
 - *.key
 - id_rsa*
 - id_ed25519*
+- *.p12
+- *.pfx
+- *.jks
+- kubeconfig
+- *.kubeconfig
+- .kube/**
+
+# Local tool state
+- .state/**
 
 # Everything else is synced
 + **
