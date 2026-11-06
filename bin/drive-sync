@@ -31,7 +31,6 @@ BISYNC_FLAGS=(
   --create-empty-src-dirs
   --drive-skip-gdocs            # native Docs/Sheets have no size; skip them
   --compare size,modtime
-  --track-renames
 )
 
 die()  { printf 'drive-sync: %s\n' "$*" >&2; exit 1; }

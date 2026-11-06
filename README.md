@@ -96,7 +96,7 @@ rclone bisync LOCAL REMOTE \
   --conflict-resolve newer --conflict-loser num \
   --resilient --recover --max-lock 2m \
   --create-empty-src-dirs --drive-skip-gdocs \
-  --compare size,modtime --track-renames \
+  --compare size,modtime \
   --filters-file FILTERS
 ```
 
