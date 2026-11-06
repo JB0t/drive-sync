@@ -24,11 +24,24 @@ cd ~/git/JB0t/drive-sync
 - It links `drive-sync` into `~/.local/bin`.
 - It creates `~/.config/drive-sync/` and puts `default.filters` in it.
 
-Next, connect your Google account. This opens a browser for sign-in:
+Next, connect your Google account.
+
+**First, create your own OAuth client.** rclone's shared Google client ID is being retired during 2026, so you need your own. It is free and takes about five minutes:
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project.
+2. Go to **APIs & Services → Library** and enable the **Google Drive API**.
+3. Set up the **OAuth consent screen** (Google Auth Platform):
+   - Choose the **External** audience, and give the app any name.
+   - **Publish** the app. While an app is in *Testing* status, its refresh tokens expire after 7 days.
+4. Go to **Clients → Create client** and choose the **Desktop app** type. Note the client ID and the client secret.
+
+Then run the following in a normal terminal. It opens a browser for sign-in:
 
 ```bash
-rclone config create gdrive drive scope=drive
+rclone config create gdrive drive scope=drive client_id=YOUR_ID client_secret=YOUR_SECRET
 ```
+
+Google warns that the app is unverified. This is expected, because it is your own app: click **Advanced → Go to (app name)**. On the permissions screen, tick the Drive permission box.
 
 Use `scope=drive`. With the narrower `drive.file` scope, rclone can only see files that rclone uploaded itself. Anything you add through the Drive web UI or another device would then never sync back down.
 
@@ -99,7 +112,6 @@ rclone bisync LOCAL REMOTE \
 - **Polling, not live.** Changes sync on the next timer run, not the moment you save.
 - **Native Google Docs, Sheets and Slides are skipped.** Drive reports no file size for them, so they cannot be compared. Ordinary files such as `.docx` and `.md` sync normally.
 - **Modification times decide conflicts.** Keep clocks synced with NTP or chrony.
-- **Shared rclone client ID.** rclone's built-in Google client ID is shared by all rclone users and rate-limited. For large trees, [create your own client ID](https://rclone.org/drive/#making-your-own-client-id) and pass `client_id=... client_secret=...` to `rclone config create`.
 
 ## Testing locally without Drive
 

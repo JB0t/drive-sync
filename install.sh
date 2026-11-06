@@ -55,8 +55,10 @@ echo "drive-sync linked to $BIN_DIR/drive-sync"
 if ! rclone listremotes 2>/dev/null | grep -q .; then
   cat <<'EOF'
 
-Next: create a Google Drive remote (opens a browser for Google sign-in):
-  rclone config create gdrive drive scope=drive
+Next: create your own Google OAuth client (rclone's shared client_id is
+being retired in 2026): https://rclone.org/drive/#making-your-own-client-id
+Then, in a normal terminal (sign-in opens a browser):
+  rclone config create gdrive drive scope=drive client_id=YOUR_ID client_secret=YOUR_SECRET
 Then add a pair, for example:
   drive-sync add role-deep-dives ~/role-deep-dives gdrive:role-deep-dives
   drive-sync install-timer 5min
